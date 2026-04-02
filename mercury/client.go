@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/ap"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 )
+
+var ErrMercuryClosed = errors.New("mercury client closed")
 
 type hermesRequest struct {
 	header *spotifypb.MercuryHeader
@@ -32,20 +35,31 @@ type Client struct {
 	ap  *ap.Accesspoint
 
 	recvLoopOnce sync.Once
+	closeOnce    sync.Once
 
 	reqChan  chan hermesRequest
 	stopChan chan struct{}
+	closedCh chan struct{}
 }
 
 func NewClient(log librespot.Logger, accesspoint *ap.Accesspoint) *Client {
 	c := &Client{log: log, ap: accesspoint}
 	c.reqChan = make(chan hermesRequest)
 	c.stopChan = make(chan struct{}, 1)
+	c.closedCh = make(chan struct{})
 	return c
 }
 
 func (c *Client) startReceiving() {
-	c.recvLoopOnce.Do(func() { go c.recvLoop() })
+	c.recvLoopOnce.Do(func() {
+		select {
+		case <-c.closedCh:
+			return
+		default:
+		}
+
+		go c.recvLoop()
+	})
 }
 
 func (c *Client) recvLoop() {
@@ -185,12 +199,18 @@ func (c *Client) Request(ctx context.Context, method, uri string, fields map[str
 	}
 
 	req := hermesRequest{header: header, parts: parts, resp: make(chan hermesResponse, 1)}
-	c.reqChan <- req
+	select {
+	case <-c.closedCh:
+		return nil, ErrMercuryClosed
+	case c.reqChan <- req:
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	select {
+	case <-c.closedCh:
+		return nil, ErrMercuryClosed
 	case <-ctx.Done():
 		return nil, context.DeadlineExceeded
 	case resp := <-req.resp:
@@ -212,6 +232,9 @@ func (c *Client) Request(ctx context.Context, method, uri string, fields map[str
 }
 
 func (c *Client) Close() {
-	c.stopChan <- struct{}{}
-	<-c.stopChan
+	c.closeOnce.Do(func() {
+		close(c.closedCh)
+		c.stopChan <- struct{}{}
+		<-c.stopChan
+	})
 }

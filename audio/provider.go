@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -12,6 +13,8 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/ap"
 )
+
+var ErrKeyProviderClosed = errors.New("audio key provider closed")
 
 type KeyProviderError struct {
 	Code uint16
@@ -26,9 +29,13 @@ type KeyProvider struct {
 	log librespot.Logger
 
 	recvLoopOnce sync.Once
+	closeOnce    sync.Once
+	closeMu      sync.RWMutex
 
 	reqChan  chan keyRequest
 	stopChan chan struct{}
+	closedCh chan struct{}
+	closed   bool
 }
 
 type keyRequest struct {
@@ -46,11 +53,20 @@ func NewAudioKeyProvider(log librespot.Logger, ap *ap.Accesspoint) *KeyProvider 
 	p := &KeyProvider{log: log, ap: ap}
 	p.reqChan = make(chan keyRequest)
 	p.stopChan = make(chan struct{}, 1)
+	p.closedCh = make(chan struct{})
 	return p
 }
 
 func (p *KeyProvider) startReceiving() {
-	p.recvLoopOnce.Do(func() { go p.recvLoop() })
+	p.recvLoopOnce.Do(func() {
+		select {
+		case <-p.closedCh:
+			return
+		default:
+		}
+
+		go p.recvLoop()
+	})
 }
 
 func (p *KeyProvider) recvLoop() {
@@ -117,12 +133,20 @@ func (p *KeyProvider) Request(ctx context.Context, gid []byte, fileId []byte) ([
 	p.startReceiving()
 
 	req := keyRequest{gid: gid, fileId: fileId, resp: make(chan keyResponse, 1)}
+	p.closeMu.RLock()
+	if p.closed {
+		p.closeMu.RUnlock()
+		return nil, ErrKeyProviderClosed
+	}
 	p.reqChan <- req
+	p.closeMu.RUnlock()
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	select {
+	case <-p.closedCh:
+		return nil, ErrKeyProviderClosed
 	case <-ctx.Done():
 		return nil, context.DeadlineExceeded
 	case resp := <-req.resp:
@@ -135,6 +159,12 @@ func (p *KeyProvider) Request(ctx context.Context, gid []byte, fileId []byte) ([
 }
 
 func (p *KeyProvider) Close() {
-	p.stopChan <- struct{}{}
-	<-p.stopChan
+	p.closeOnce.Do(func() {
+		p.closeMu.Lock()
+		p.closed = true
+		close(p.closedCh)
+		p.closeMu.Unlock()
+		p.stopChan <- struct{}{}
+		<-p.stopChan
+	})
 }
